@@ -1,8 +1,17 @@
+import asyncio
+from collections import deque
+
 from homeassistant.components.cover import CoverDeviceClass, CoverEntity
+from homeassistant.exceptions import HomeAssistantError
 
 from .core.const import DOMAIN
 from .core.entity import XEntity
-from .core.ewelink import SIGNAL_ADD_ENTITIES, XRegistry
+from .core.ewelink import (
+    SIGNAL_ADD_ENTITIES,
+    SIGNAL_CONNECTED,
+    SIGNAL_DEVICE_EVENT,
+    XRegistry,
+)
 
 PARALLEL_UPDATES = 0  # fix entity_platform parallel_updates Semaphore
 
@@ -249,20 +258,231 @@ class XCoverT5(XCover):
 
 # noinspection PyAbstractClass
 class XCover216(XCover):
+    """Track UIID 216 gates which report doorState twice during opening."""
+
     params = {"switch", "doorState"}
     _attr_device_class = CoverDeviceClass.GATE
     _attr_is_closed = None
+    event = True  # An initial snapshot is not a movement notification.
+
+    def __init__(self, ewelink: XRegistry, device: dict):
+        self._operation = "unknown"
+        self._fully_open: bool | None = None
+        self._opening_reports: int | None = None
+        self._revision = 0
+        self._command_lock = asyncio.Lock()
+        self._stop_lock = asyncio.Lock()
+        self._command_request = 0
+        # Bounded replay history, retained across pauses and reconnects. d_seq is
+        # opaque: compare equality only, never ordering or device/app clocks.
+        self._seen = deque(maxlen=128)
+        super().__init__(ewelink, device)
+        door = device["params"].get("doorState")
+        if type(door) is int and door in (0, 1):
+            self._attr_is_closed = door == 0
+            if door == 0:
+                self._operation, self._fully_open = "closed", False
+        self.async_on_remove(
+            ewelink.dispatcher_connect(
+                device["deviceid"] + SIGNAL_DEVICE_EVENT, self._handle_event
+            )
+        )
+        self.async_on_remove(
+            ewelink.cloud.dispatcher_connect(SIGNAL_CONNECTED, self._connection_changed)
+        )
+
+    @property
+    def extra_state_attributes(self):
+        return {"operation_state": self._operation, "fully_open": self._fully_open}
+
+    @property
+    def is_opening(self) -> bool:
+        return self._operation == "opening"
+
+    @property
+    def is_closing(self) -> bool:
+        return self._operation == "closing"
+
+    @property
+    def assumed_state(self) -> bool:
+        # HA treats open without a percentage as fully open. Override that only
+        # between known endstops, so a partial stop can still resume either way.
+        return self._attr_is_closed is not True and self._fully_open is not True
 
     def set_state(self, params: dict):
-        # => command to cover from mobile app (ignore initial state)
-        if len(params) == 1 and "switch" in params:
-            # device receive command - on=open/off=close/pause=stop
-            self._attr_is_opening = params["switch"] == "on"
-            self._attr_is_closing = params["switch"] == "off"
+        # State-only callbacks include query replies and omit notification IDs.
+        # Process these through _handle_event exactly once instead.
+        pass
 
-        if "doorState" in params:
-            self._attr_is_closing = self._attr_is_opening = False
-            self._attr_is_closed = params["doorState"] == 0
+    def internal_update(self, params: dict | None = None):
+        interrupted = not self.internal_available() or (
+            params and params.get("online") is False
+        )
+        if interrupted:
+            self._forget_movement()
+        super().internal_update(params)
+        if interrupted:
+            self._write_state()
+
+    def _write_state(self):
+        if self.hass:
+            self._async_write_ha_state()
+
+    def _forget_movement(self):
+        self._revision += 1
+        self._command_request += 1
+        self._operation = "unknown"
+        self._fully_open = None
+        self._opening_reports = None
+        self._attr_is_closed = None
+
+    def _connection_changed(self):
+        # Cloud observation can be interrupted even while LAN remains available.
+        self._forget_movement()
+        self._write_state()
+
+    def _remember(self, key: tuple) -> bool:
+        if key in self._seen:
+            return False
+        self._seen.append(key)
+        return True
+
+    @staticmethod
+    def _identity(value) -> str | None:
+        if type(value) in (int, str) and str(value):
+            return str(value)
+        return None
+
+    def _command(self, command: str, sequence: str | None) -> bool:
+        if sequence and not self._remember(("command", sequence, command)):
+            return False
+        self._revision += 1
+        self._opening_reports = 0 if command == "on" and sequence else None
+        if command == "pause":
+            self._operation = "stopped"
+        else:
+            self._operation = "opening" if command == "on" else "closing"
+            # Opening invalidates a previous closed position. Keep a known
+            # non-closed position until a fresh device report confirms closure;
+            # this gate need not send another 1 while closing before a pause.
+            if self._attr_is_closed is not False:
+                self._attr_is_closed = None
+            self._fully_open = None
+        self._write_state()
+        return True
+
+    def _handle_event(self, source: str, msg: dict):
+        params = msg.get("params", {})
+        if not self.available or params.get("online") is False:
+            return
+        if source != "cloud":
+            if params.keys() & self.params:
+                # The two-report protocol is only qualified for cloud pushes.
+                # A LAN response may echo a cached endstop or command value.
+                self._forget_movement()
+                if type(params.get("doorState")) is int and params["doorState"] == 1:
+                    self._attr_is_closed = False
+                self._write_state()
+            return
+        if msg.get("action") != "update":
+            return  # Initial state, queries and reconnect snapshots never count.
+        command = params.get("switch")
+        if msg.get("userAgent") == "app" and command in ("on", "off", "pause"):
+            if self._command(command, self._identity(msg.get("sequence"))):
+                # A new external command supersedes a pending local reversal.
+                # Echoes of our own commands have already been remembered.
+                self._command_request += 1
+            return
+        if msg.get("userAgent") != "device":
+            return
+
+        door = params.get("doorState")
+        if type(door) is not int or door not in (0, 1):
+            return
+        identity = self._identity(msg.get("d_seq"))
+        if identity and not self._remember((source, identity, door)):
+            return
+        self._update_position(door, identity)
+        self._write_state()
+
+    def _update_position(self, door: int, identity: str | None):
+        """Apply a validated device report after filtering queries and replays."""
+        self._revision += 1
+        if door == 0:
+            self._attr_is_closed = True
+            self._operation, self._fully_open = "closed", False
+            self._opening_reports = None
+            return
+
+        if identity is None:
+            # Position is non-closed, but an unidentified report cannot complete
+            # an opening sequence.
+            self._forget_movement()
+        self._attr_is_closed = False
+        if self._opening_reports is not None:
+            self._opening_reports += 1
+            if self._opening_reports == 2:
+                self._operation, self._fully_open = "open", True
+                self._opening_reports = None
+        elif self._operation == "closed":
+            # Movement without an observed command has no known direction.
+            self._operation, self._fully_open = "unknown", None
+
+    async def _async_command(self, command: str, request: int):
+        sequence = await self.ewelink.sequence()
+        if request != self._command_request:
+            return
+        if command == "on" and self._fully_open is True:
+            return
+        if command == "off" and self._attr_is_closed is True:
+            return
+        self._command(command, sequence)
+        revision = self._revision
+        try:
+            result = await self.ewelink.send(
+                self.device,
+                {"switch": command},
+                query_cloud=False,
+                sequence=sequence,
+                return_status=True,
+            )
+            if result != "online":
+                raise HomeAssistantError("Gate command was not acknowledged")
+        except (Exception, asyncio.CancelledError):
+            if self._revision == revision:
+                self._forget_movement()
+                self._write_state()
+            raise
+
+    async def _async_control(self, command: str):
+        # Serialize stop/start pairs. New requests supersede pending ones, so an
+        # explicit stop never leaves an older reversal queued to restart later.
+        self._command_request += 1
+        request = self._command_request
+        if command == "pause":
+            # Stop can bypass a movement awaiting acknowledgement. New movement
+            # must still wait for this stop to be acknowledged before starting.
+            async with self._stop_lock:
+                await self._async_command(command, request)
+            return
+        async with self._command_lock:
+            async with self._stop_lock:
+                if request != self._command_request:
+                    return
+                if (command == "on" and self.is_closing) or (
+                    command == "off" and self.is_opening
+                ):
+                    await self._async_command("pause", request)
+            await self._async_command(command, request)
+
+    async def async_open_cover(self, **kwargs):
+        await self._async_control("on")
+
+    async def async_close_cover(self, **kwargs):
+        await self._async_control("off")
+
+    async def async_stop_cover(self, **kwargs):
+        await self._async_control("pause")
 
     async def async_set_cover_position(self, position: int, **kwargs):
         return  # Device has no position control — no-op.
