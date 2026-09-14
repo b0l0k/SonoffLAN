@@ -4,14 +4,13 @@ import time
 
 from aiohttp import ClientSession
 
-from .base import SIGNAL_CONNECTED, SIGNAL_UPDATE, XDevice, XRegistryBase
+from .base import SIGNAL_CONNECTED, SIGNAL_UPDATE, XDevice, XRegistryBase, XUpdate
 from .cloud import XRegistryCloud
 from .local import XRegistryLocal
 
 _LOGGER = logging.getLogger(__name__)
 
 SIGNAL_ADD_ENTITIES = "add_entities"
-SIGNAL_DEVICE_EVENT = "_event"
 LOCAL_TTL = 60
 
 
@@ -244,9 +243,7 @@ class XRegistry(XRegistryBase):
         if "sledOnline" in params:
             device["params"]["sledOnline"] = params["sledOnline"]
 
-        self.dispatcher_send(did, params)
-        # Keep notification provenance separate from the existing state callbacks.
-        self.dispatcher_send(did + SIGNAL_DEVICE_EVENT, "cloud", msg)
+        self.dispatcher_send(did, XUpdate(params, "cloud", msg))
 
     def local_update(self, msg: dict):
         mainid: str = msg["deviceid"]
@@ -315,10 +312,7 @@ class XRegistry(XRegistryBase):
         device["localping"] = ts + 59  # one second less than a minute
         device["localrecv"] = ts
 
-        self.dispatcher_send(realid, params)
-        self.dispatcher_send(
-            realid + SIGNAL_DEVICE_EVENT, "local", {**msg, "params": params}
-        )
+        self.dispatcher_send(realid, XUpdate(params, "local", msg))
 
         # send empty msg to main device for updating available flag
         if realid != mainid:

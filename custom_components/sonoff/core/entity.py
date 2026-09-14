@@ -97,11 +97,15 @@ class XEntity(Entity):
         except Exception as e:
             _LOGGER.error(f"Can't init device: {device}", exc_info=e)
 
-        ewelink.dispatcher_connect(deviceid, self.internal_update)
+        self.async_on_remove(ewelink.dispatcher_connect(deviceid, self.internal_update))
 
         if parent := device.get("parent"):
             self._attr_device_info["via_device"] = (DOMAIN, parent["deviceid"])
-            ewelink.dispatcher_connect(parent["deviceid"], self.internal_parent_update)
+            self.async_on_remove(
+                ewelink.dispatcher_connect(
+                    parent["deviceid"], self.internal_parent_update
+                )
+            )
 
     @property
     def suggested_object_id(self) -> str | None:

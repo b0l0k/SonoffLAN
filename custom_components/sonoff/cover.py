@@ -6,12 +6,7 @@ from homeassistant.exceptions import HomeAssistantError
 
 from .core.const import DOMAIN
 from .core.entity import XEntity
-from .core.ewelink import (
-    SIGNAL_ADD_ENTITIES,
-    SIGNAL_CONNECTED,
-    SIGNAL_DEVICE_EVENT,
-    XRegistry,
-)
+from .core.ewelink import SIGNAL_ADD_ENTITIES, XRegistry, XUpdate
 
 PARALLEL_UPDATES = 0  # fix entity_platform parallel_updates Semaphore
 
@@ -273,6 +268,7 @@ class XCover216(XCover):
         self._command_lock = asyncio.Lock()
         self._stop_lock = asyncio.Lock()
         self._command_request = 0
+        self._cloud_online = ewelink.cloud.online
         # Bounded replay history, retained across pauses and reconnects. d_seq is
         # opaque: compare equality only, never ordering or device/app clocks.
         self._seen = deque(maxlen=128)
@@ -282,14 +278,6 @@ class XCover216(XCover):
             self._attr_is_closed = door == 0
             if door == 0:
                 self._operation, self._fully_open = "closed", False
-        self.async_on_remove(
-            ewelink.dispatcher_connect(
-                device["deviceid"] + SIGNAL_DEVICE_EVENT, self._handle_event
-            )
-        )
-        self.async_on_remove(
-            ewelink.cloud.dispatcher_connect(SIGNAL_CONNECTED, self._connection_changed)
-        )
 
     @property
     def extra_state_attributes(self):
@@ -309,15 +297,16 @@ class XCover216(XCover):
         # between known endstops, so a partial stop can still resume either way.
         return self._attr_is_closed is not True and self._fully_open is not True
 
-    def set_state(self, params: dict):
-        # State-only callbacks include query replies and omit notification IDs.
-        # Process these through _handle_event exactly once instead.
-        pass
-
     def internal_update(self, params: dict | None = None):
-        interrupted = not self.internal_available() or (
-            params and params.get("online") is False
+        # Cloud connection changes already dispatch an update to every entity,
+        # including when LAN keeps the device available.
+        cloud_online = self.ewelink.cloud.online
+        interrupted = (
+            self._cloud_online != cloud_online
+            or not self.internal_available()
+            or (params and params.get("online") is False)
         )
+        self._cloud_online = cloud_online
         if interrupted:
             self._forget_movement()
         super().internal_update(params)
@@ -335,11 +324,6 @@ class XCover216(XCover):
         self._fully_open = None
         self._opening_reports = None
         self._attr_is_closed = None
-
-    def _connection_changed(self):
-        # Cloud observation can be interrupted even while LAN remains available.
-        self._forget_movement()
-        self._write_state()
 
     def _remember(self, key: tuple) -> bool:
         if key in self._seen:
@@ -368,22 +352,25 @@ class XCover216(XCover):
             if self._attr_is_closed is not False:
                 self._attr_is_closed = None
             self._fully_open = None
-        self._write_state()
         return True
 
-    def _handle_event(self, source: str, msg: dict):
-        params = msg.get("params", {})
-        if not self.available or params.get("online") is False:
+    def set_state(self, params: dict):
+        # Cached/plain parameters have no provenance and cannot count as events.
+        if (
+            not isinstance(params, XUpdate)
+            or not self.available
+            or params.get("online") is False
+        ):
             return
-        if source != "cloud":
+        if params.source != "cloud":
             if params.keys() & self.params:
                 # The two-report protocol is only qualified for cloud pushes.
                 # A LAN response may echo a cached endstop or command value.
                 self._forget_movement()
                 if type(params.get("doorState")) is int and params["doorState"] == 1:
                     self._attr_is_closed = False
-                self._write_state()
             return
+        msg = params.message
         if msg.get("action") != "update":
             return  # Initial state, queries and reconnect snapshots never count.
         command = params.get("switch")
@@ -400,10 +387,9 @@ class XCover216(XCover):
         if type(door) is not int or door not in (0, 1):
             return
         identity = self._identity(msg.get("d_seq"))
-        if identity and not self._remember((source, identity, door)):
+        if identity and not self._remember((params.source, identity, door)):
             return
         self._update_position(door, identity)
-        self._write_state()
 
     def _update_position(self, door: int, identity: str | None):
         """Apply a validated device report after filtering queries and replays."""
@@ -437,6 +423,7 @@ class XCover216(XCover):
         if command == "off" and self._attr_is_closed is True:
             return
         self._command(command, sequence)
+        self._write_state()
         revision = self._revision
         try:
             result = await self.ewelink.send(

@@ -6,11 +6,8 @@ from unittest.mock import AsyncMock
 import pytest
 from homeassistant.exceptions import HomeAssistantError
 
-from custom_components.sonoff.core.ewelink import (
-    SIGNAL_DEVICE_EVENT,
-    SIGNAL_UPDATE,
-    XRegistry,
-)
+from custom_components.sonoff.core.ewelink import SIGNAL_UPDATE, XRegistry
+from custom_components.sonoff.core.ewelink.local import encrypt
 from custom_components.sonoff.cover import XCover216
 
 from . import DEVICEID, init
@@ -728,11 +725,50 @@ def test_uiid216_tracks_movement_without_device_configuration(make_gate):
     assert_gate(gate, "open", "open", True)
 
 
-def test_other_models_do_not_subscribe_to_gate_events(make_gate):
-    reg, other = make_gate(uiid=1)
+def test_other_models_have_no_gate_attributes(make_gate):
+    _, other = make_gate(uiid=1)
     assert not isinstance(other, XCover216)
     assert "operation_state" not in other.hass.states.get(other.entity_id).attributes
-    assert not reg.dispatcher.get(DEVICEID + SIGNAL_DEVICE_EVENT)
+
+
+@pytest.mark.parametrize("door", [0, 1])
+def test_plain_updates_cannot_complete_or_interrupt_an_opening(make_gate, door):
+    reg, gate = make_gate()
+    command(reg, "on", "open")
+    report(reg, 1, 1)
+    reg.dispatcher_send(DEVICEID, {"doorState": door})
+    reg.dispatcher_send(DEVICEID, {"switch": "pause"})
+    reg.dispatcher_send(DEVICEID)
+    assert_gate(gate, "opening", "opening")
+    report(reg, 1, 2)
+    assert_gate(gate, "open", "open", True)
+
+
+@pytest.mark.parametrize("door", [0, 1])
+def test_encrypted_lan_update_discards_cloud_opening_inference(make_gate, door):
+    reg, gate = make_gate()
+    command(reg, "on", "open")
+    report(reg, 1, 1)
+    key = gate.device["devicekey"] = "synthetic-test-device-key"
+    msg = {"deviceid": DEVICEID, "localtype": "plug", "seq": "lan-1"}
+    msg.update(encrypt({"data": {"doorState": door}}, key))
+    reg.local.dispatcher_send(SIGNAL_UPDATE, msg)
+    assert_gate(gate, "open" if door else "unknown", "unknown")
+    report(reg, 1, 2)
+    assert_gate(gate, "open", "unknown")
+
+
+@pytest.mark.parametrize("uiid", [1, 216])
+def test_removed_entity_does_not_receive_updates(make_gate, loop, uiid):
+    reg, entity = make_gate(uiid=uiid)
+    entity.hass.loop = loop
+    loop.run_until_complete(entity.async_remove(force_remove=True))
+    assert entity.hass.states.get(entity.entity_id) is None
+    command(reg, "on", "after-removal")
+    report(reg, 1, 1)
+    reg.cloud.set_online(False)
+    reg.cloud.set_online(True)
+    assert entity.hass.states.get(entity.entity_id) is None
 
 
 @pytest.mark.parametrize("status", ["online", "offline"])

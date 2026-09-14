@@ -8,6 +8,15 @@ SIGNAL_CONNECTED = "connected"
 SIGNAL_UPDATE = "update"
 
 
+class XUpdate(dict):
+    """Device parameters with transport metadata outside the state keys."""
+
+    def __init__(self, params: dict, source: str, message: dict):
+        super().__init__(params)
+        self.source = source
+        self.message = message
+
+
 class XDevice(TypedDict, total=False):
     deviceid: str
     extra: dict
